@@ -24,15 +24,12 @@
 #include <time.h>
 #include <curl/curl.h>
 #include <openssl/hmac.h>
-#include <openssl/sha.h>
-#include <openssl/md5.h>
+#include <openssl/evp.h>
+#if OPENSSL_VERSION_NUMBER >= 0x30000000L
+#include <openssl/params.h>
+#endif
 #include "fio.h"
 #include "../optgroup.h"
-
-/*
- * Silence OpenSSL 3.0 deprecated function warnings
- */
-#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
 
 enum {
 	FIO_HTTP_WEBDAV	    = 0,
@@ -297,18 +294,22 @@ static char *_conv_hex(const unsigned char *p, size_t len)
 
 static char *_gen_hex_sha256(const char *p, size_t len)
 {
-	unsigned char hash[SHA256_DIGEST_LENGTH];
+	unsigned char hash[EVP_MAX_MD_SIZE];
+	unsigned int out_len = 0;
 
-	SHA256((unsigned char*)p, len, hash);
-	return _conv_hex(hash, SHA256_DIGEST_LENGTH);
+	if (EVP_Digest((const unsigned char*)p, len, hash, &out_len, EVP_sha256(), NULL) != 1)
+		return NULL;
+	return _conv_hex(hash, out_len);
 }
 
 static char *_gen_hex_md5(const char *p, size_t len)
 {
-	unsigned char hash[MD5_DIGEST_LENGTH];
+	unsigned char hash[EVP_MAX_MD_SIZE];
+	unsigned int out_len = 0;
 
-	MD5((unsigned char*)p, len, hash);
-	return _conv_hex(hash, MD5_DIGEST_LENGTH);
+	if (EVP_Digest((const unsigned char*)p, len, hash, &out_len, EVP_md5(), NULL) != 1)
+		return NULL;
+	return _conv_hex(hash, out_len);
 }
 
 static char *_conv_base64_encode(const unsigned char *p, size_t len)
@@ -354,12 +355,43 @@ static char *_conv_base64_encode(const unsigned char *p, size_t len)
 
 static char *_gen_base64_md5(const unsigned char *p, size_t len)
 {
-	unsigned char hash[MD5_DIGEST_LENGTH];
-	MD5((unsigned char*)p, len, hash);
-	return _conv_base64_encode(hash, MD5_DIGEST_LENGTH);
+	unsigned char hash[EVP_MAX_MD_SIZE];
+	unsigned int out_len = 0;
+	if (EVP_Digest((const unsigned char*)p, len, hash, &out_len, EVP_md5(), NULL) != 1)
+		return NULL;
+	return _conv_base64_encode(hash, out_len);
 }
 
 static void _hmac(unsigned char *md, void *key, int key_len, char *data) {
+#if OPENSSL_VERSION_NUMBER >= 0x30000000L
+	EVP_MAC *mac = NULL;
+	EVP_MAC_CTX *ctx = NULL;
+	size_t mac_len = 0;
+	unsigned char tmp[EVP_MAX_MD_SIZE];
+	OSSL_PARAM params[2];
+
+	params[0] = OSSL_PARAM_construct_utf8_string("digest", (char *)"SHA256", 0);
+	params[1] = OSSL_PARAM_construct_end();
+
+	mac = EVP_MAC_fetch(NULL, "HMAC", NULL);
+	if (!mac)
+		return;
+	ctx = EVP_MAC_CTX_new(mac);
+	if (!ctx) {
+		EVP_MAC_free(mac);
+		return;
+	}
+	if (EVP_MAC_init(ctx, (const unsigned char *)key, (size_t)key_len, params) != 1)
+		goto out;
+	if (EVP_MAC_update(ctx, (const unsigned char *)data, strlen(data)) != 1)
+		goto out;
+	if (EVP_MAC_final(ctx, tmp, &mac_len, sizeof(tmp)) != 1)
+		goto out;
+	memcpy(md, tmp, mac_len);
+out:
+	EVP_MAC_CTX_free(ctx);
+	EVP_MAC_free(mac);
+#else
 #ifndef CONFIG_HAVE_OPAQUE_HMAC_CTX
 	HMAC_CTX _ctx;
 #endif
@@ -380,6 +412,7 @@ static void _hmac(unsigned char *md, void *key, int key_len, char *data) {
 	HMAC_CTX_free(ctx);
 #else
 	HMAC_CTX_cleanup(ctx);
+#endif
 #endif
 }
 
@@ -437,7 +470,8 @@ static void _add_aws_auth_header(CURL *curl, struct curl_slist *slist, struct ht
 	char *signature = NULL;
 	const char *service = "s3";
 	const char *aws = "aws4_request";
-	unsigned char md[SHA256_DIGEST_LENGTH];
+	unsigned char md[EVP_MAX_MD_SIZE];
+	int sha256_len = EVP_MD_size(EVP_sha256());
 	unsigned char sse_key[33] = {0};
 	char *sse_key_base64 = NULL;
 	char *sse_key_md5_base64 = NULL;
@@ -526,12 +560,12 @@ static void _add_aws_auth_header(CURL *curl, struct curl_slist *slist, struct ht
 
 	snprintf((char *)dkey, sizeof(dkey), "AWS4%s", o->s3_key);
 	_hmac(md, dkey, strlen(dkey), date_short);
-	_hmac(md, md, SHA256_DIGEST_LENGTH, o->s3_region);
-	_hmac(md, md, SHA256_DIGEST_LENGTH, (char*) service);
-	_hmac(md, md, SHA256_DIGEST_LENGTH, (char*) aws);
-	_hmac(md, md, SHA256_DIGEST_LENGTH, sts);
+	_hmac(md, md, sha256_len, o->s3_region);
+	_hmac(md, md, sha256_len, (char*) service);
+	_hmac(md, md, sha256_len, (char*) aws);
+	_hmac(md, md, sha256_len, sts);
 
-	signature = _conv_hex(md, SHA256_DIGEST_LENGTH);
+	signature = _conv_hex(md, (size_t)sha256_len);
 
 	/* Suppress automatic Accept: header */
 	slist = curl_slist_append(slist, "Accept:");
